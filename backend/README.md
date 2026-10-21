@@ -28,6 +28,16 @@ npm start
 - **GET /api/events** — Retrieve paginated `dispute_escalated` events (query params: `after` ledger, `limit` max 100)
 - **GET /api/stream** — Server-Sent Events stream of new disputes (SSE)
 
+### Stats
+
+- **GET /api/stats** — Contract-wide aggregate metrics for dashboard/landing widgets (#56)
+  - Returns: `{ totalShipments, totalVolume, totalDisputes, completedShipments, totalEscrowed?, fetchedAt }`
+  - `totalVolume` is returned as a string to preserve i128 precision (stroops)
+  - `totalEscrowed` is included only when `STELLAR_STATS_TOKEN` env var is set to a token SAC address
+  - Results are cached in-memory for 30 seconds (`x-cache` header: `hit` / `miss` / `stale`)
+  - Returns 503 if `STELLAR_CONTRACT_ID` is not configured or the contract call fails
+  - Description: Aggregates on-chain figures from the contract's `get_contract_stats` and `get_total_escrowed_value` read functions
+
 ### Shipments
 
 - **GET /api/shipments** — List shipment IDs with pagination (query params: `after` cursor, `limit` max 100)
@@ -43,37 +53,6 @@ npm start
   - Response: `{ milestones: Array<Milestone & { notes: MilestoneNote[] }> }`
   - Returns 404 if shipment ID not found
   - Description: Returns milestone list with status, proof hash, and associated notes for each milestone
-
-### Metadata
-
-- **GET /api/metadata/:shipmentId** — Retrieve all metadata for a shipment
-  - Returns: `{ [key: string]: { value: string, updatedAt: string } }`
-
-- **PUT /api/metadata/:shipmentId/:key** — Store off-chain metadata (requires `X-API-Key` header)
-  - Body: `{ value: string }`
-  - Returns 401 if `METADATA_API_KEY` not configured or mismatched
-  - Returns 400 if value exceeds 4000 characters
-
-## API Endpoints
-
-### Health & Events
-
-- **GET /api/health** — Check service status, network, and event monitor state
-- **GET /api/events** — Retrieve paginated `dispute_escalated` events (query params: `after` ledger, `limit` max 100)
-- **GET /api/stream** — Server-Sent Events stream of new disputes (SSE)
-
-### Shipments
-
-- **GET /api/shipments** — List shipment IDs with pagination (query params: `after` cursor, `limit` max 100)
-  - Returns: `{ shipments: string[], nextCursor?: number }`
-  
-- **GET /api/shipments/:id** — Retrieve full shipment details
-  - Response: Full `Shipment` struct (all 51+ fields)
-  - Returns 404 if shipment ID not found
-  
-- **GET /api/shipments/:id/milestones** — List all milestones for a shipment with notes
-  - Response: `{ milestones: Array<Milestone & { notes: MilestoneNote[] }> }`
-  - Returns 404 if shipment ID not found
 
 ### Metadata
 

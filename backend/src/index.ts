@@ -7,6 +7,21 @@ import { dirname, resolve } from "node:path";
 import { scValToNative, rpc, xdr } from "@stellar/stellar-sdk";
 import { z } from "zod";
 
+/**
+ * Make a read-only Soroban contract call via RPC simulation.
+ *
+ * Uses `rpc.Server.queryContract`, which builds a simulated transaction
+ * (no signatures required) and returns the decoded return value.
+ *
+ * @param method  Contract function name (e.g. "get_contract_stats")
+ * @param args    Arguments object keyed by parameter name (empty for no-arg calls)
+ * @returns       Decoded native JS value from the contract's return ScVal
+ */
+async function readContract<T = unknown>(method: string, args: Record<string, unknown> = {}): Promise<T> {
+  const { result } = await rpcServer.queryContract(config.STELLAR_CONTRACT_ID, method, args);
+  return result as T;
+}
+
 const envSchema = z.object({
   HOST: z.string().default("127.0.0.1"),
   PORT: z.coerce.number().int().positive().default(8787),
@@ -72,6 +87,89 @@ app.get("/api/health", async () => ({
   eventMonitor: config.STELLAR_CONTRACT_ID ? (rpcHealthy ? "connected" : "connecting") : "disabled",
   lastScannedLedger: lastScannedLedger ?? null,
 }));
+
+// ---------------------------------------------------------------------------
+// GET /api/stats — contract-wide aggregate metrics for dashboard widgets (#56)
+//
+// Aggregates on-chain figures from three contract read functions:
+//   - get_contract_stats()  → { total_shipments, total_volume, total_disputes, completed_shipments }
+//   - get_total_escrowed_value(token) → i128 (aggregate locked escrow for the token)
+//   - get_tvl(token) → i128 (TVL cap check / aggregate escrow, same storage key)
+//
+// Because these are read-only simulated calls with no auth, the endpoint is
+// cheap to serve.  Results are cached in-memory for STATS_CACHE_TTL_MS (30 s
+// default) to avoid hammering the RPC on every request while still being
+// fresh enough for an overview widget.
+// ---------------------------------------------------------------------------
+
+const STATS_CACHE_TTL_MS = 30_000; // 30-second cache
+
+type ContractStatsRaw = {
+  total_shipments: number | string;
+  total_volume: number | string;
+  total_disputes: number | string;
+  completed_shipments: number | string;
+};
+
+type StatsCache = {
+  data: Record<string, unknown>;
+  fetchedAt: number;
+};
+
+let statsCache: StatsCache | undefined;
+
+app.get("/api/stats", async (_request, reply) => {
+  if (!config.STELLAR_CONTRACT_ID) {
+    return reply.code(503).send({ error: "contract_not_configured" });
+  }
+
+  // Serve from cache if still fresh
+  const now = Date.now();
+  if (statsCache && now - statsCache.fetchedAt < STATS_CACHE_TTL_MS) {
+    return reply.header("x-cache", "hit").send(statsCache.data);
+  }
+
+  try {
+    // Fetch contract-level stats (no args)
+    const contractStats = await readContract<ContractStatsRaw>("get_contract_stats");
+
+    // Fetch aggregate escrowed value.  The contract tracks this per-token via
+    // DataKey::TotalEscrowed(token).  We don't have a specific token address
+    // in the env config, so we query get_total_escrowed_value.  When no
+    // shipments have been created for a token the contract returns 0.
+    //
+    // For a contract-wide stats endpoint we report the contract_stats fields
+    // (which aggregate across all shipments) and optionally the per-token
+    // escrow if STELLAR_STATS_TOKEN is configured.
+    let totalEscrowed: string | null = null;
+    const statsToken = process.env.STELLAR_STATS_TOKEN;
+    if (statsToken) {
+      totalEscrowed = String(
+        await readContract<number | string>("get_total_escrowed_value", { token: statsToken }),
+      );
+    }
+
+    const data = {
+      totalShipments: Number(contractStats.total_shipments),
+      totalVolume: String(contractStats.total_volume),
+      totalDisputes: Number(contractStats.total_disputes),
+      completedShipments: Number(contractStats.completed_shipments),
+      ...(totalEscrowed !== null ? { totalEscrowed } : {}),
+      fetchedAt: new Date().toISOString(),
+    };
+
+    statsCache = { data, fetchedAt: now };
+
+    return reply.header("x-cache", "miss").send(data);
+  } catch (error) {
+    app.log.error({ err: error }, "Failed to fetch contract stats");
+    // If we have a stale cache, serve it with a warning header
+    if (statsCache) {
+      return reply.header("x-cache", "stale").send(statsCache.data);
+    }
+    return reply.code(503).send({ error: "contract_query_failed" });
+  }
+});
 
 app.get<{ Querystring: { after?: string; limit?: string } }>("/api/events", async (request) => {
   const after = Math.max(0, Number(request.query.after ?? 0) || 0);
